@@ -14,11 +14,17 @@ This tool is built to identify misconfigurations, whitelist bypasses, and RCE op
 🚀 Features
 
 ✅ Extension fuzzing with built-in categories or custom wordlists
+
 ✅ Double & reverse extension attacks
+
 ✅ Special characters injection (%00, %0a, : etc.)
+
 ✅ Content-Type header fuzzing (use custom list or defaults)
+
 ✅ Magic bytes injection (prepend real image headers)
+
 ✅ Auto-detect uploaded shells and spawn interactive shell
+
 ✅ Beautiful color-coded results table with rich
 
 📦 Installation
