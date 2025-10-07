@@ -28,7 +28,7 @@ This tool is built to identify misconfigurations, whitelist bypasses, and RCE op
 
 ---
 
-## 🎯 Features
+##  Features
 
 ### Attack Modes
 - **RCE (Remote Code Execution)** - Upload web shells and achieve command execution
@@ -62,7 +62,7 @@ pip install requests rich
 ```
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Basic RCE Attack
 ```bash
